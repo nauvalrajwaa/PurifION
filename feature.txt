@@ -1,0 +1,25 @@
+Make pipeline with 2 base point algorithm below, integrate and adapt for plant mitogenome
+
+
+[1]
+Context & Depth-Aware NUMT Scrubber
+Konteks & Gap: Cara standar memfilter reads mitokondria adalah dengan minimap2 menggunakan referensi. Masalahnya, NUMTs (DNA inti yang mirip mitokondria) akan ikut tertarik. Saat dirakit, NUMTs ini akan membuat graf assembly menjadi kusut karena mereka memiliki flanking region (ujung) berupa DNA inti.
+
+Ide Proyek: Sebuah filter cerdas yang tidak hanya melihat kecocokan sekuens (homologi), tetapi mengevaluasi profil coverage dan flanking context dari setiap read. Mitogenom asli akan memiliki coverage yang seragam dan sangat tinggi. NUMTs akan memiliki coverage rendah (setara genom inti) dan sering kali ujung-ujungnya tidak mapping ke referensi mitokondria.
+
+Fitur Kunci: Membuang reads yang terdeteksi sebagai NUMTs murni atau chimeric reads (setengah mitokondria, setengah genom inti), dan hanya menyisakan reads mitokondria "bersih".
+
+Tech Stack: Python, pysam, minimap2, algoritma sliding window untuk deteksi coverage drop.
+
+[2]
+Smart Uniform Downsampler for Circular Topologies
+Konteks & Gap: Mitogenom sangat berlimpah. Jika Anda memberikan 10.000x coverage ke assembler long-read, algoritma graph-based akan kebingungan dan menghasilkan assembly yang terpecah atau waktu komputasi yang meledak. Random subsampling (mengambil sekian persen reads secara acak) sering kali menghilangkan reads terpanjang yang sangat krusial untuk menyelesaikan repeat regions (area berulang).
+
+Ide Proyek: Alat subsampling khusus organel yang melakukan normalisasi coverage secara cerdas. Alat ini memetakan reads ke seed awal, lalu memilih subset reads (misalnya diturunkan menjadi 100x coverage yang stabil) dengan memprioritaskan: 1) Reads terpanjang, dan 2) Reads dengan kualitas Phred score (Q-score) tertinggi dari basecalling ONT terbaru (Q20+).
+
+Fitur Kunci: Memastikan coverage rata dari ujung ke ujung tanpa membuang spanning reads (reads yang melingkupi seluruh mitogenom), sehingga assembler bisa langsung menghasilkan 1 circular contig.
+
+Tech Stack: Rust (untuk kecepatan pemrosesan FASTQ berukuran besar) atau C++, htslib.
+
+[3]
+make a final report html for results
