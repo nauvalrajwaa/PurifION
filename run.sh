@@ -70,6 +70,20 @@ GENOME_SIZE="${GENOME_SIZE:-500k}"
 # Target coverage for downsampler
 TARGET_COV="${TARGET_COV:-100}"
 
+FILTER_MODE="${FILTER_MODE:-numt}"
+
+PAF_LEN_A="${PAF_LEN_A:-5000}"
+PAF_ID_A="${PAF_ID_A:-0.90}"
+PAF_LEN_B="${PAF_LEN_B:-3000}"
+PAF_ID_B="${PAF_ID_B:-0.98}"
+
+RUN_CHECK_JOINS="${RUN_CHECK_JOINS:-0}"
+JOINS_WINDOW="${JOINS_WINDOW:-500}"
+JOINS_MIN_ID="${JOINS_MIN_ID:-75}"
+JOINS_MIN_OVLP="${JOINS_MIN_OVLP:-100}"
+JOINS_EXPECTED_SIZE="${JOINS_EXPECTED_SIZE:-494000}"
+JOINS_SIZE_TOLERANCE="${JOINS_SIZE_TOLERANCE:-0.20}"
+
 # ---------------------------------------------------------------------------
 # ② PATHS & HELPERS
 # ---------------------------------------------------------------------------
@@ -216,12 +230,27 @@ PIPELINE_CMD=(
     --reference    "${MERGED_REF}"
     --outdir       "${OUTDIR}"
     --threads      "${THREADS}"
+    --filter-mode  "${FILTER_MODE}"
+    --paf-len-a    "${PAF_LEN_A}"
+    --paf-id-a     "${PAF_ID_A}"
+    --paf-len-b    "${PAF_LEN_B}"
+    --paf-id-b     "${PAF_ID_B}"
     --target-coverage "${TARGET_COV}"
     --genome-size  "${GENOME_SIZE}"
 )
 
 if [ "${RUN_ASSEMBLER}" = "1" ]; then
     PIPELINE_CMD+=(--run-assembler --assembler flye)
+    if [ "${RUN_CHECK_JOINS}" = "1" ]; then
+        PIPELINE_CMD+=(
+            --run-check-joins
+            --joins-window "${JOINS_WINDOW}"
+            --joins-min-id "${JOINS_MIN_ID}"
+            --joins-min-ovlp "${JOINS_MIN_OVLP}"
+            --joins-expected-size "${JOINS_EXPECTED_SIZE}"
+            --joins-size-tolerance "${JOINS_SIZE_TOLERANCE}"
+        )
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -234,8 +263,10 @@ log "  Reads      : ${READS}"
 log "  Reference  : ${MERGED_REF} (${N_CHROMS} chr)"
 log "  Output dir : ${OUTDIR}"
 log "  Threads    : ${THREADS}"
+log "  Filter mode: ${FILTER_MODE}"
 log "  Target cov : ${TARGET_COV}x"
 log "  Assembler  : $([ "${RUN_ASSEMBLER}" = "1" ] && echo "Flye (${GENOME_SIZE})" || echo "disabled")"
+log "  Check joins: $([ "${RUN_CHECK_JOINS}" = "1" ] && echo "enabled" || echo "disabled")"
 log "========================================"
 
 "${PIPELINE_CMD[@]}"
