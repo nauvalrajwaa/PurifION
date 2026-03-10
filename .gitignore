@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local runtime outputs
+results/
+results_*/
+
+# Graph analysis generated outputs
+old_methods/candidate_joins*.tsv
+old_methods/disentangle*.tsv
+old_methods/disentangle*.fasta
+old_methods/disentangle*.txt
+
+# Assembly outputs
+*/03_assembly/candidate_joins.tsv
+*/03_assembly/check_joins_summary.txt
