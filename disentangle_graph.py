@@ -615,7 +615,15 @@ def main() -> None:
         seq = stitch_path_sequence(segments=segments, edge_index=edge_index, path=p)
         if seq is None or not seq:
             continue
-        name = f"cand_{i}|{p.kind}|len={p.total_len}|mean_id={p.mean_identity:.2f}|nodes={path_to_str(p.nodes)}"
+        # Name after the merged contigs (unique segment names in traversal order)
+        merged_segs = []
+        seen_seg_names: set = set()
+        for seg_name, _ in p.nodes:
+            if seg_name not in seen_seg_names:
+                merged_segs.append(seg_name)
+                seen_seg_names.add(seg_name)
+        contig_name = "__".join(merged_segs)
+        name = f"{contig_name}|{p.kind}|len={p.total_len}|mean_id={p.mean_identity:.2f}"
         records.append((name, seq))
     write_fasta(fasta_path, records)
 

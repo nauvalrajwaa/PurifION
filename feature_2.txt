@@ -1,0 +1,10 @@
+I have 2 schemes, i will let you choose which is the best
+
+1.⁠ ⁠filter by id paf is global for all chromosome first than downsampler to several subsampler > assembler > gfa results is each chromosome
+2.⁠ ⁠⁠filter by id paf specific each chromosome > than generate several subsampler >  assembly > gfa results is each chromosome
+
+feature update:
+
+1. do evaluation to scrub methods (I think its risky, we cant remove mitogenome reads), and its better to remove
+2. make disentagle graph is mandatory not optional (always generate disentangled gfa at the end)
+3. makesure new edge created by disentangle_graph (merged results by disentangle from checks joining terminal) named with contig thats merged

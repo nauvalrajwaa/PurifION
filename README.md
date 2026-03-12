@@ -1,73 +1,76 @@
 # MitoAssembler
 
-Plant mitogenome assembly pipeline for ONT long reads, with two filtering modes and optional post-assembly graph-join analysis.
+Plant mitogenome assembly pipeline for ONT long reads. Performs per-chromosome filtering, downsampling, optional assembly, and mandatory graph disentanglement.
 
 ## Current Workflow
 
 ```text
 raw ONT reads
       |
-      |  choose one filtering mode
-      |  - numt: scrubber-based filtering
-      |  - paf : dual-threshold PAF filtering
       v
-[1] Filtered reads
+[1] Per-chromosome PAF filter
+    minimap2 (map-ont) → PAF
+    Each read assigned to best-matching chromosome
+    Dual-threshold: (len≥len_a AND id≥id_a) OR (len≥len_b AND id≥id_b)
+      |
+      v (per chromosome)
+[2] Per-chromosome Downsampler
+    uniform coverage normalization within each chromosome
+      |
+      v (per chromosome, if --run-assembler)
+[3] Per-chromosome Flye assembly
+    assembly.fasta + assembly_graph.gfa per chromosome
+      |
+      v (per chromosome, mandatory after assembly)
+[4] disentangle_graph.py
+    terminal-overlap graph, cycle/path search, stitched FASTA
       |
       v
-[2] downsampler.py (uniform coverage normalization)
-      |
-      v
-[3] (optional) Flye assembly
-      |
-      +--> (optional) check_joins.py on assembly_graph.gfa
-      |
-      +--> (optional, standalone) disentangle_graph.py for deep terminal-overlap/cycle search
-      v
-[4] report.py (HTML report)
+[5] report.py  →  report/report.html
 ```
 
-## Two Filter Modes (Pipeline)
+> **No scrub step.** The numt/paf scrubbing modes have been removed. The pipeline goes straight from raw reads into per-chromosome PAF filtering.
 
-The pipeline supports two filtering strategies via `--filter-mode` (or `FILTER_MODE` in `run.sh`):
+---
 
-1. `numt`
-- Uses `numt_scrubber.py` logic (MAPQ/mapped-fraction/soft-clip/coverage-based filtering).
-- Recommended default for most datasets.
+## Per-chromosome PAF Filter
 
-2. `paf`
-- Uses old dual-threshold PAF filter strategy (compatible with `old_methods` behavior).
-- Tunable with:
-  - `--paf-len-a` / `--paf-id-a`
-  - `--paf-len-b` / `--paf-id-b`
+Reads are aligned to the full reference with `minimap2 -cx map-ont`. Each read is assigned to the chromosome it aligns to best (highest score = matching\_bases × aligned\_length). A read is **kept** if it passes either threshold:
 
-## Post-Assembly Analysis
+| Threshold | Length | Identity |
+|-----------|--------|----------|
+| A (long)  | ≥ `--paf-len-a` (5000 bp) | ≥ `--paf-id-a` (0.90) |
+| B (medium)| ≥ `--paf-len-b` (3000 bp) | ≥ `--paf-id-b` (0.98) |
 
-### 1) `check_joins.py` (integrated into pipeline)
+`identity = matching_bases / aligned_length`
 
-When assembly is enabled, you can automatically run terminal join analysis on Flye graph:
+Each chromosome gets its own `filtered.fastq`, which feeds its own independent downsampler and assembler.
 
-- Enable with `--run-check-joins` (or `RUN_CHECK_JOINS=1` in `run.sh`).
-- Input: `03_assembly/assembly_graph.gfa`
-- Outputs:
-  - `03_assembly/candidate_joins.tsv`
-  - `03_assembly/check_joins_summary.txt`
+---
 
-### 2) `disentangle_graph.py` (standalone, deeper analysis)
+## Post-Assembly: `disentangle_graph.py` (mandatory)
 
-Use after assembly (or on any GFA) for:
-- all-vs-all oriented terminal overlap graph,
-- per-contig self-terminal circularization checks,
-- expected-size and any-size cycle/path search,
-- stitched candidate FASTA outputs,
-- consolidated text report.
+After every successful chromosome assembly, `disentangle_graph.py` is run automatically. It performs:
 
-Typical outputs (`--out-prefix PREFIX`):
-- `PREFIX.terminal_overlaps.tsv`
-- `PREFIX.self_terminal.tsv`
-- `PREFIX.paths.tsv`
-- `PREFIX.cycles_any.tsv`
-- `PREFIX.path_sequences.fasta`
-- `PREFIX.report.txt`
+- All-vs-all oriented terminal overlap graph
+- Per-contig self-terminal circularization checks
+- Expected-size and any-size cycle/path search
+- Stitched candidate FASTA with contig-name-based edge naming
+
+**Edge naming:** merged path sequences are named after the actual contigs traversed:
+```
+contig_1__contig_2|cycle|len=490000|mean_id=89.50
+```
+
+Outputs per chromosome (under `02_assembly/<chrom>/`):
+- `disentangle.terminal_overlaps.tsv`
+- `disentangle.self_terminal.tsv`
+- `disentangle.paths.tsv`
+- `disentangle.cycles_any.tsv`
+- `disentangle.path_sequences.fasta`
+- `disentangle.report.txt`
+
+---
 
 ## Requirements
 
@@ -81,9 +84,9 @@ pip install pysam biopython
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| minimap2 | >= 2.26 | Read alignment |
-| samtools | >= 1.17 | BAM handling |
-| flye | >= 2.9 | Assembly (optional) |
+| minimap2 | ≥ 2.26 | Read alignment and PAF filtering |
+| samtools | ≥ 1.17 | BAM handling (downsampler) |
+| flye | ≥ 2.9 | Assembly (optional) |
 
 Recommended conda environment:
 
@@ -92,53 +95,48 @@ conda create -n mitoasm python=3.11 pysam biopython minimap2 samtools flye -c bi
 conda activate mitoasm
 ```
 
+---
+
 ## Running with `run.sh` (Recommended)
 
 `run.sh` handles reference fetch/prep and calls `pipeline.py`.
 
-### A) Default NUMT mode + downsampling (no assembly)
+### A) Per-chromosome filter + downsampling only (no assembly)
 
 ```bash
 READS=raw_reads.fastq \
 REF_SOURCE=local \
 REF_PATH=reference/mito_ref.fasta \
-FILTER_MODE=numt \
 TARGET_COV=100 \
 THREADS=16 \
 bash run.sh
 ```
 
-### B) PAF mode (old_methods style) + downsampling
+### B) Full pipeline: filter + downsample + assembly + disentangle
 
 ```bash
 READS=raw_reads.fastq \
 REF_SOURCE=local \
 REF_PATH=reference/mito_ref.fasta \
-FILTER_MODE=paf \
+RUN_ASSEMBLER=1 \
+GENOME_SIZE=500k \
+TARGET_COV=100 \
+THREADS=16 \
+bash run.sh
+```
+
+### C) Custom PAF thresholds + full pipeline
+
+```bash
+READS=raw_reads.fastq \
+REF_SOURCE=local \
+REF_PATH=reference/mito_ref.fasta \
 PAF_LEN_A=5000 \
 PAF_ID_A=0.90 \
 PAF_LEN_B=3000 \
 PAF_ID_B=0.98 \
-TARGET_COV=100 \
-THREADS=16 \
-bash run.sh
-```
-
-### C) Full pipeline: PAF mode + assembly + check_joins
-
-```bash
-READS=raw_reads.fastq \
-REF_SOURCE=local \
-REF_PATH=reference/mito_ref.fasta \
-FILTER_MODE=paf \
 RUN_ASSEMBLER=1 \
 GENOME_SIZE=500k \
-RUN_CHECK_JOINS=1 \
-JOINS_WINDOW=500 \
-JOINS_MIN_ID=75 \
-JOINS_MIN_OVLP=100 \
-JOINS_EXPECTED_SIZE=494000 \
-JOINS_SIZE_TOLERANCE=0.20 \
 TARGET_COV=100 \
 THREADS=16 \
 bash run.sh
@@ -155,45 +153,43 @@ bash run.sh
 
 Set `ACCESSIONS=(...)` inside `run.sh` for your species/chromosomes.
 
+---
+
 ## Running `pipeline.py` Directly
 
-### 1) NUMT mode + downsampling
+### 1) Filter + downsampling only
 
 ```bash
 python pipeline.py \
   --reads raw_reads.fastq \
   --reference reference/mito_ref.fasta \
-  --outdir results_numt \
+  --outdir results/ \
   --threads 16 \
-  --filter-mode numt \
   --target-coverage 100
 ```
 
-### 2) PAF mode + downsampling
+### 2) Full pipeline: filter + downsample + assembly + disentangle
 
 ```bash
 python pipeline.py \
   --reads raw_reads.fastq \
   --reference reference/mito_ref.fasta \
-  --outdir results_paf \
+  --outdir results/ \
   --threads 16 \
-  --filter-mode paf \
-  --paf-len-a 5000 \
-  --paf-id-a 0.90 \
-  --paf-len-b 3000 \
-  --paf-id-b 0.98 \
-  --target-coverage 100
+  --target-coverage 100 \
+  --run-assembler \
+  --assembler flye \
+  --genome-size 500k
 ```
 
-### 3) Full run + assembly + integrated check_joins
+### 3) Custom PAF thresholds + custom disentangle params
 
 ```bash
 python pipeline.py \
   --reads raw_reads.fastq \
   --reference reference/mito_ref.fasta \
-  --outdir results_full \
+  --outdir results/ \
   --threads 16 \
-  --filter-mode paf \
   --paf-len-a 5000 \
   --paf-id-a 0.90 \
   --paf-len-b 3000 \
@@ -202,100 +198,132 @@ python pipeline.py \
   --run-assembler \
   --assembler flye \
   --genome-size 500k \
-  --run-check-joins \
-  --joins-window 500 \
-  --joins-min-id 75 \
-  --joins-min-ovlp 100 \
-  --joins-expected-size 494000 \
-  --joins-size-tolerance 0.20
+  --disentangle-expected-size 494000 \
+  --disentangle-size-tolerance 0.20 \
+  --disentangle-window 500 \
+  --disentangle-min-id 75 \
+  --disentangle-min-ovlp 100 \
+  --disentangle-max-depth 8
 ```
 
-## Standalone Graph Analysis Commands
+---
 
-### A) check_joins on an existing GFA
+## Standalone Graph Analysis
 
-```bash
-python check_joins.py old_methods/assembly_graph.gfa \
-  --window 500 \
-  --min-id 75 \
-  --min-ovlp 100 \
-  --expected-size 494000 \
-  --size-tolerance 0.20 \
-  --out old_methods/candidate_joins.tsv
-```
-
-### B) disentangle_graph on an existing GFA
+### `disentangle_graph.py` on an existing GFA
 
 ```bash
-python disentangle_graph.py old_methods/assembly_graph.gfa \
+python disentangle_graph.py assembly_graph.gfa \
   --window 500 \
   --min-id 75 \
   --min-ovlp 100 \
   --expected-size 494000 \
   --size-tolerance 0.20 \
   --max-depth 8 \
-  --out-prefix old_methods/disentangle_full
+  --out-prefix results/disentangle
 ```
 
-### C) Try alternate expected sizes for difficult samples
+### Try alternate expected sizes for difficult samples
 
 ```bash
-python disentangle_graph.py old_methods/assembly_graph.gfa \
+python disentangle_graph.py assembly_graph.gfa \
   --expected-size 70000 \
   --size-tolerance 0.20 \
-  --out-prefix old_methods/disentangle_70k
+  --out-prefix results/disentangle_70k
 ```
+
+### `check_joins.py` on an existing GFA (standalone)
+
+```bash
+python check_joins.py assembly_graph.gfa \
+  --window 500 \
+  --min-id 75 \
+  --min-ovlp 100 \
+  --expected-size 494000 \
+  --size-tolerance 0.20 \
+  --out candidate_joins.tsv
+```
+
+---
 
 ## Output Layout
 
 ```text
 results/
-+-- 01_numt_scrubbed/            # filtered reads output directory
-|   +-- scrubbed.fastq
-|   +-- numt_stats.json
-+-- 02_downsampled/
-|   +-- downsampled.fastq
-|   +-- downsample_stats.json
-+-- 03_assembly/                 # present when --run-assembler
-|   +-- assembly.fasta
-|   +-- assembly_graph.gfa
-|   +-- candidate_joins.tsv      # when --run-check-joins
-|   +-- check_joins_summary.txt  # when --run-check-joins
-+-- report/
-|   +-- report.html
-+-- pipeline_params.json
+├── 01_per_chrom/
+│   ├── <chrom_1>/
+│   │   ├── filtered.fastq           # PAF-filtered reads for this chromosome
+│   │   ├── downsampled.fastq        # uniform-coverage downsampled reads
+│   │   └── downsample_stats.json
+│   └── <chrom_2>/
+│       └── ...
+├── 02_assembly/                     # present when --run-assembler
+│   ├── <chrom_1>/
+│   │   ├── assembly.fasta
+│   │   ├── assembly_graph.gfa
+│   │   ├── disentangle.terminal_overlaps.tsv
+│   │   ├── disentangle.self_terminal.tsv
+│   │   ├── disentangle.paths.tsv
+│   │   ├── disentangle.cycles_any.tsv
+│   │   ├── disentangle.path_sequences.fasta
+│   │   └── disentangle.report.txt
+│   └── <chrom_2>/
+│       └── ...
+├── report/
+│   └── report.html
+└── pipeline_params.json
 ```
 
-`disentangle_graph.py` outputs are written wherever `--out-prefix` points.
+---
 
 ## Key CLI Parameters
 
-| Group | Parameter | Default | Description |
-|------|-----------|---------|-------------|
-| filter | `--filter-mode` | `numt` | Filtering strategy: `numt` or `paf` |
-| paf | `--paf-len-a` | `5000` | PAF threshold A length |
-| paf | `--paf-id-a` | `0.90` | PAF threshold A identity |
-| paf | `--paf-len-b` | `3000` | PAF threshold B length |
-| paf | `--paf-id-b` | `0.98` | PAF threshold B identity |
-| numt | `--min-mapq` | `20` | Minimum MAPQ |
-| numt | `--min-mapped-fraction` | `0.80` | Minimum mapped fraction |
-| numt | `--max-softclip-fraction` | `0.20` | Maximum softclip fraction |
-| numt | `--coverage-window` | `500` | Coverage window size |
-| numt | `--coverage-threshold-ratio` | `0.20` | Low-coverage threshold ratio |
-| downsample | `--target-coverage` | `100` | Target normalized coverage |
-| downsample | `--bin-size` | `500` | Bin size (bp) |
-| downsample | `--spanning-fraction` | `0.80` | Always keep spanning reads above this fraction |
-| assembly | `--run-assembler` | off | Enable Flye |
-| assembly | `--genome-size` | `500k` | Flye genome size estimate |
-| joins | `--run-check-joins` | off | Run `check_joins.py` after assembly |
-| joins | `--joins-window` | `500` | Join terminal window |
-| joins | `--joins-min-id` | `75.0` | Min join identity (%) |
-| joins | `--joins-min-ovlp` | `100` | Min join overlap (bp) |
-| joins | `--joins-expected-size` | `494000` | Expected circular size |
-| joins | `--joins-size-tolerance` | `0.20` | Size tolerance fraction |
+### PAF Filter
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--paf-len-a` | `5000` | Threshold A: minimum alignment length |
+| `--paf-id-a` | `0.90` | Threshold A: minimum identity |
+| `--paf-len-b` | `3000` | Threshold B: minimum alignment length |
+| `--paf-id-b` | `0.98` | Threshold B: minimum identity |
+
+### Downsampler
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--target-coverage` | `100` | Target normalized coverage per chromosome |
+| `--bin-size` | `500` | Bin size in bp for greedy selection |
+| `--spanning-fraction` | `0.80` | Always retain reads spanning ≥ this fraction |
+
+### Assembly
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--run-assembler` | off | Enable per-chromosome Flye assembly |
+| `--assembler` | `flye` | Assembler to use |
+| `--genome-size` | `500k` | Flye genome size estimate |
+
+### Disentangle (auto-applied after assembly)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--disentangle-window` | `500` | Terminal window size (bp) |
+| `--disentangle-min-id` | `75.0` | Minimum terminal overlap identity (%) |
+| `--disentangle-min-ovlp` | `100` | Minimum overlap length (bp) |
+| `--disentangle-top-out` | `5` | Top N edges per source+orientation |
+| `--disentangle-expected-size` | `494000` | Expected circular chromosome size |
+| `--disentangle-size-tolerance` | `0.20` | Size tolerance fraction (±20%) |
+| `--disentangle-max-depth` | `8` | Max DFS depth for path search |
+| `--disentangle-max-cycles` | `30` | Max expected-size cycles to report |
+| `--disentangle-max-linear` | `50` | Max linear paths to report |
+| `--disentangle-max-cycles-any` | `200` | Max any-size cycles to report |
+| `--disentangle-fasta-top` | `20` | Top N sequences to write to FASTA |
+
+---
 
 ## Notes for Difficult Samples
 
-- If full circular mt path is not found, inspect `candidate_joins.tsv` and `disentangle` outputs for strong local loops/joins.
-- Try multiple expected sizes with `disentangle_graph.py`.
-- Keep both filter modes in your comparison matrix (`numt` vs `paf`) before deciding final assembly strategy.
+- If no full circular path is found, inspect `disentangle.cycles_any.tsv` and `disentangle.paths.tsv` for partial loops or strong local joins.
+- Try multiple expected sizes with `--disentangle-expected-size` to account for size variation.
+- Per-chromosome `filtered.fastq` and `downsampled.fastq` can be reused for manual assembly attempts.
+- Edge names in `disentangle.path_sequences.fasta` encode the merged contigs: `contig_A__contig_B|kind|len=...|mean_id=...`.

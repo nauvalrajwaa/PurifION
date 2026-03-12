@@ -3,12 +3,11 @@
 pipeline.py — MitoAssembler End-to-End Pipeline
 ================================================
 Single-command wrapper that orchestrates:
-  1. NUMT Scrubber    (numt_scrubber.py)
-  2. Uniform Downsampler (downsampler.py)
-  3. HTML Report      (report.py)
-
-Optionally runs an assembler (default: Flye in --nano-hq mode) on the
-final clean reads to produce a mitogenome assembly.
+  1. Per-chromosome PAF filter  (minimap2 PAF → per-chromosome read sets)
+  2. Per-chromosome Downsampler (downsampler.py, one run per chromosome)
+  3. Per-chromosome Flye assembly
+  4. Disentangle graph          (disentangle_graph.py — mandatory)
+  5. HTML Report                (report.py)
 
 Usage
 -----
@@ -19,19 +18,23 @@ Usage
         [--threads 16] \\
         [--target-coverage 100] \\
         [--run-assembler] \\
-        [--assembler flye]  \\
+        [--assembler flye] \\
         [--genome-size 500k]
 
 Output layout (inside --outdir)
 --------------------------------
-    01_numt_scrubbed/
-        scrubbed.fastq
-        numt_stats.json
-    02_downsampled/
-        downsampled.fastq
-        downsample_stats.json
-    03_assembly/           (only when --run-assembler)
-        assembly.fasta
+    01_per_chrom/
+        <chrom>/
+            filtered.fastq
+            downsampled.fastq
+            downsample_stats.json
+    02_assembly/           (only when --run-assembler)
+        <chrom>/
+            assembly.fasta
+            assembly_graph.gfa
+            disentangle.report.txt
+            disentangle.terminal_overlaps.tsv
+            ...
     report/
         report.html
     pipeline_params.json
@@ -48,14 +51,13 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pysam
 
 # Local modules (same directory)
 sys.path.insert(0, os.path.dirname(__file__))
 
-import numt_scrubber
 import downsampler
 import report as report_mod
 
@@ -68,27 +70,40 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# PAF dual-threshold filter  (replicates old_methods/align2.sh)
+# Reference helpers
 # ---------------------------------------------------------------------------
 
-def _run_paf_filter(
+def _get_chrom_names(reference: str) -> List[str]:
+    """Return ordered list of sequence names from a FASTA reference."""
+    names: List[str] = []
+    with open(reference) as fh:
+        for line in fh:
+            if line.startswith(">"):
+                names.append(line[1:].split()[0])
+    return names
+
+
+# ---------------------------------------------------------------------------
+# Per-chromosome PAF filter
+# ---------------------------------------------------------------------------
+
+def _run_paf_filter_per_chrom(
     reads: str,
     reference: str,
-    output_fastq: str,
+    chrom_names: List[str],
+    out_dir: Path,
     threads: int,
     len_a: int = 5000,
     id_a: float = 0.90,
     len_b: int = 3000,
     id_b: float = 0.98,
-) -> Dict:
+) -> Dict[str, str]:
     """
-    Dual-threshold PAF filter that replicates old_methods/align2.sh.
+    Align all reads against the reference with minimap2 (PAF output).
+    For each chromosome, collect reads that pass the dual-threshold filter
+    AND whose primary alignment target is that chromosome.
 
-    Keep a read when EITHER condition is true:
-      A) aligned_length >= len_a  AND  identity >= id_a  (long reads, relaxed id)
-      B) aligned_length >= len_b  AND  identity >= id_b  (medium reads, strict id)
-
-    identity = matching_bases / aligned_length  (PAF col10 / col11)
+    Returns a dict: {chrom_name: path_to_filtered_fastq}
     """
     log.info(
         "PAF filter thresholds: A(len>=%d id>=%.2f)  B(len>=%d id>=%.2f)",
@@ -106,11 +121,12 @@ def _run_paf_filter(
         with open(paf_path, "w") as paf_fh:
             subprocess.run(mm2_cmd, stdout=paf_fh, check=True)
 
-        keep_names: Set[str] = set()
-        total_aln = 0
-        passed_a = 0
-        passed_b = 0
+        # chrom → set of read names that passed filter targeting that chrom
+        chrom_reads: Dict[str, Set[str]] = {c: set() for c in chrom_names}
+        # Track best (score) alignment per read to assign it to one chrom
+        read_best_score: Dict[str, Tuple[float, str]] = {}  # name → (score, chrom)
 
+        total_aln = 0
         with open(paf_path) as paf_fh:
             for line in paf_fh:
                 cols = line.split("\t")
@@ -118,42 +134,145 @@ def _run_paf_filter(
                     continue
                 total_aln += 1
                 read_name = cols[0]
+                target_name = cols[5]
                 aln_len = int(cols[10])
                 matches = int(cols[9])
                 if aln_len == 0:
                     continue
                 identity = matches / aln_len
-                if aln_len >= len_a and identity >= id_a:
-                    keep_names.add(read_name)
-                    passed_a += 1
-                elif aln_len >= len_b and identity >= id_b:
-                    keep_names.add(read_name)
-                    passed_b += 1
+
+                passes = (aln_len >= len_a and identity >= id_a) or \
+                         (aln_len >= len_b and identity >= id_b)
+                if not passes:
+                    continue
+                if target_name not in chrom_reads:
+                    continue
+
+                score = identity * aln_len
+                prev = read_best_score.get(read_name)
+                if prev is None or score > prev[0]:
+                    # Remove from old chrom if re-assigned
+                    if prev is not None:
+                        chrom_reads[prev[1]].discard(read_name)
+                    read_best_score[read_name] = (score, target_name)
+                    chrom_reads[target_name].add(read_name)
 
         log.info(
-            "PAF filter: %d alignments → %d unique reads (cond_A=%d cond_B=%d)",
-            total_aln, len(keep_names), passed_a, passed_b,
+            "PAF filter: %d alignments, reads per chrom: %s",
+            total_aln,
+            {c: len(v) for c, v in chrom_reads.items()},
         )
 
-    written = 0
-    with pysam.FastxFile(reads) as fin, open(output_fastq, "w") as fout:
+    # Write per-chromosome FASTQ files
+    result: Dict[str, str] = {}
+    # Accumulate all reads once into memory to avoid re-scanning for each chrom
+    read_seqs: Dict[str, Tuple[str, str]] = {}  # name → (seq, qual)
+    with pysam.FastxFile(reads) as fin:
         for entry in fin:
-            if entry.name in keep_names:
-                qual = entry.quality or ""
-                fout.write(f"@{entry.name}\n{entry.sequence}\n+\n{qual}\n")
-                written += 1
+            if entry.name is not None:
+                read_seqs[entry.name] = (entry.sequence or "", entry.quality or "")
 
-    log.info("PAF filter: wrote %d reads to %s", written, output_fastq)
+    for chrom in chrom_names:
+        chrom_dir = out_dir / chrom
+        chrom_dir.mkdir(parents=True, exist_ok=True)
+        out_fastq = str(chrom_dir / "filtered.fastq")
+        written = 0
+        with open(out_fastq, "w") as fout:
+            for rname in chrom_reads[chrom]:
+                if rname in read_seqs:
+                    seq, qual = read_seqs[rname]
+                    fout.write(f"@{rname}\n{seq}\n+\n{qual}\n")
+                    written += 1
+        log.info("  Chrom %-30s → %d reads → %s", chrom, written, out_fastq)
+        result[chrom] = out_fastq
 
-    return {
-        "filter_mode": "paf",
-        "total_alignments": total_aln,
-        "passed_condition_a": passed_a,
-        "passed_condition_b": passed_b,
-        "unique_reads_kept": len(keep_names),
-        "output_reads": written,
-        "thresholds": {"len_a": len_a, "id_a": id_a, "len_b": len_b, "id_b": id_b},
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Per-chromosome downsampler
+# ---------------------------------------------------------------------------
+
+def _downsample_chrom(
+    filtered_reads: str,
+    reference: str,
+    chrom_name: str,
+    out_fastq: str,
+    stats_path: str,
+    threads: int,
+    target_coverage: int,
+    bin_size: int,
+    spanning_fraction: float,
+) -> Dict:
+    """
+    Run downsampler for a single chromosome.
+    Aligns filtered reads (already chromosome-specific) to full reference,
+    restricts to the target chromosome, and runs greedy bin selection.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bam_path = os.path.join(tmpdir, "ds_aligned.bam")
+        downsampler.run_minimap2(
+            reference=reference,
+            reads=filtered_reads,
+            bam_out=bam_path,
+            threads=threads,
+        )
+        ds_reads = downsampler.load_read_info(bam_path, min_mapq=10)
+
+        bam = pysam.AlignmentFile(bam_path, "rb")
+        ref_lengths = dict(zip(bam.references, bam.lengths))
+        bam.close()
+
+        # Restrict ref_lengths to just this chromosome so coverage is computed correctly
+        chrom_ref_lengths = {chrom_name: ref_lengths[chrom_name]} if chrom_name in ref_lengths else ref_lengths
+
+        # Filter ds_reads to only reads on this chromosome
+        chrom_reads = [r for r in ds_reads if r.ref_name == chrom_name]
+        if not chrom_reads:
+            log.warning("  No mapped reads on %s after downsampler alignment", chrom_name)
+            open(out_fastq, "w").close()
+            stats: Dict = {
+                "chrom": chrom_name,
+                "input_alignments": 0,
+                "spanning_reads": 0,
+                "selected_reads": 0,
+                "output_reads": 0,
+                "target_coverage": target_coverage,
+                "achieved_coverage": {},
+                "ref_lengths": chrom_ref_lengths,
+            }
+            with open(stats_path, "w") as fh:
+                json.dump(stats, fh, indent=2)
+            return stats
+
+        spanning = downsampler.find_spanning_reads(chrom_reads, chrom_ref_lengths, spanning_fraction)
+        selected = downsampler.greedy_bin_selection(
+            chrom_reads, chrom_ref_lengths, target_coverage=target_coverage, bin_size=bin_size
+        )
+        keep = selected | spanning
+
+        ds_written = downsampler.extract_reads(filtered_reads, keep, out_fastq)
+        log.info(
+            "  Chrom %-30s downsampler: %d → %d reads",
+            chrom_name, len(chrom_reads), ds_written,
+        )
+
+        achieved = downsampler.compute_achieved_coverage(keep, chrom_reads, chrom_ref_lengths)
+
+    stats = {
+        "chrom": chrom_name,
+        "input_alignments": len(chrom_reads),
+        "spanning_reads": len(spanning),
+        "selected_reads": len(keep),
+        "output_reads": ds_written,
+        "target_coverage": target_coverage,
+        "achieved_coverage": achieved,
+        "ref_lengths": chrom_ref_lengths,
     }
+    with open(stats_path, "w") as fh:
+        json.dump(stats, fh, indent=2)
+    return stats
+
 
 # ---------------------------------------------------------------------------
 # Assembler helpers
@@ -183,63 +302,73 @@ def _run_flye(
     return assembly
 
 
-def _run_check_joins(
+ASSEMBLERS = {
+    "flye": _run_flye,
+}
+
+
+def _run_disentangle(
     gfa_path: str,
-    out_tsv: str,
-    summary_txt: str,
+    out_prefix: str,
     window: int,
     min_id: float,
     min_ovlp: int,
+    top_out: int,
     expected_size: int,
     size_tolerance: float,
+    max_depth: int,
+    max_cycles: int,
+    max_linear: int,
+    max_cycles_any: int,
+    fasta_top: int,
 ) -> Dict:
-    check_joins_script = os.path.join(os.path.dirname(__file__), "check_joins.py")
-    if not os.path.exists(check_joins_script):
-        raise FileNotFoundError(f"check_joins.py not found at {check_joins_script}")
+    """Run disentangle_graph.py on a GFA file (mandatory after assembly)."""
+    disentangle_script = os.path.join(os.path.dirname(__file__), "disentangle_graph.py")
+    if not os.path.exists(disentangle_script):
+        raise FileNotFoundError(f"disentangle_graph.py not found at {disentangle_script}")
 
     cmd = [
         sys.executable,
-        check_joins_script,
+        disentangle_script,
         gfa_path,
-        "--window",
-        str(window),
-        "--min-id",
-        str(min_id),
-        "--min-ovlp",
-        str(min_ovlp),
-        "--expected-size",
-        str(expected_size),
-        "--size-tolerance",
-        str(size_tolerance),
-        "--out",
-        out_tsv,
+        "--window", str(window),
+        "--min-id", str(min_id),
+        "--min-ovlp", str(min_ovlp),
+        "--top-out", str(top_out),
+        "--expected-size", str(expected_size),
+        "--size-tolerance", str(size_tolerance),
+        "--max-depth", str(max_depth),
+        "--max-cycles", str(max_cycles),
+        "--max-linear", str(max_linear),
+        "--max-cycles-any", str(max_cycles_any),
+        "--fasta-top", str(fasta_top),
+        "--out-prefix", out_prefix,
     ]
-    log.info("check_joins command: %s", " ".join(cmd))
+    log.info("disentangle_graph command: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    with open(summary_txt, "w") as fh:
-        if proc.stdout:
-            fh.write(proc.stdout)
+    report_txt = f"{out_prefix}.report.txt"
+    with open(report_txt, "a") as fh:
         if proc.stderr:
             fh.write("\n[stderr]\n")
             fh.write(proc.stderr)
 
     if proc.returncode != 0:
         raise RuntimeError(
-            f"check_joins failed (exit={proc.returncode}). "
-            f"See {summary_txt} for details."
+            f"disentangle_graph failed (exit={proc.returncode}). "
+            f"See {report_txt} for details."
         )
 
     return {
         "gfa": gfa_path,
-        "candidate_joins_tsv": out_tsv,
-        "summary_txt": summary_txt,
+        "out_prefix": out_prefix,
+        "terminal_overlaps_tsv": f"{out_prefix}.terminal_overlaps.tsv",
+        "paths_tsv": f"{out_prefix}.paths.tsv",
+        "cycles_any_tsv": f"{out_prefix}.cycles_any.tsv",
+        "self_terminal_tsv": f"{out_prefix}.self_terminal.tsv",
+        "path_sequences_fasta": f"{out_prefix}.path_sequences.fasta",
+        "report_txt": report_txt,
     }
-
-
-ASSEMBLERS = {
-    "flye": _run_flye,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -251,15 +380,7 @@ def run_pipeline(
     reference: str,
     outdir: str,
     threads: int = 4,
-    # Filter mode
-    filter_mode: str = "numt",
-    # NUMT scrubber options (filter_mode='numt')
-    min_mapq: int = 20,
-    min_mapped_fraction: float = 0.80,
-    max_softclip_fraction: float = 0.20,
-    coverage_window: int = 500,
-    coverage_threshold_ratio: float = 0.20,
-    # PAF dual-threshold options (filter_mode='paf')
+    # PAF filter options
     paf_len_a: int = 5000,
     paf_id_a: float = 0.90,
     paf_len_b: int = 3000,
@@ -272,30 +393,37 @@ def run_pipeline(
     run_assembler: bool = False,
     assembler: str = "flye",
     genome_size: str = "500k",
-    run_check_joins: bool = False,
-    joins_window: int = 500,
-    joins_min_id: float = 75.0,
-    joins_min_ovlp: int = 100,
-    joins_expected_size: int = 494000,
-    joins_size_tolerance: float = 0.20,
+    # Disentangle options (always run when assembly is enabled)
+    disentangle_window: int = 500,
+    disentangle_min_id: float = 75.0,
+    disentangle_min_ovlp: int = 100,
+    disentangle_top_out: int = 5,
+    disentangle_expected_size: int = 494000,
+    disentangle_size_tolerance: float = 0.20,
+    disentangle_max_depth: int = 8,
+    disentangle_max_cycles: int = 30,
+    disentangle_max_linear: int = 50,
+    disentangle_max_cycles_any: int = 200,
+    disentangle_fasta_top: int = 20,
     # Reporting
     report_name: str = "report.html",
 ) -> None:
     start_time = datetime.now()
 
+    # Resolve chromosome names from reference
+    chrom_names = _get_chrom_names(reference)
+    if not chrom_names:
+        raise ValueError(f"No sequences found in reference: {reference}")
+    log.info("Reference chromosomes (%d): %s", len(chrom_names), chrom_names)
+
     # Create output directories
-    dir_scrubbed = Path(outdir) / "01_numt_scrubbed"
-    dir_down = Path(outdir) / "02_downsampled"
-    dir_asm = Path(outdir) / "03_assembly"
+    dir_per_chrom = Path(outdir) / "01_per_chrom"
+    dir_asm = Path(outdir) / "02_assembly"
     dir_report = Path(outdir) / "report"
 
-    for d in [dir_scrubbed, dir_down, dir_report]:
+    for d in [dir_per_chrom, dir_report]:
         d.mkdir(parents=True, exist_ok=True)
 
-    scrubbed_reads = str(dir_scrubbed / "scrubbed.fastq")
-    numt_stats_path = str(dir_scrubbed / "numt_stats.json")
-    downsampled_reads = str(dir_down / "downsampled.fastq")
-    ds_stats_path = str(dir_down / "downsample_stats.json")
     report_path = str(dir_report / report_name)
     params_path = str(Path(outdir) / "pipeline_params.json")
 
@@ -305,189 +433,146 @@ def run_pipeline(
         "reference": os.path.abspath(reference),
         "outdir": os.path.abspath(outdir),
         "threads": threads,
-        "min_mapq": min_mapq,
-        "min_mapped_fraction": min_mapped_fraction,
-        "max_softclip_fraction": max_softclip_fraction,
-        "coverage_window": coverage_window,
-        "coverage_threshold_ratio": coverage_threshold_ratio,
+        "chromosomes": chrom_names,
+        "paf_len_a": paf_len_a,
+        "paf_id_a": paf_id_a,
+        "paf_len_b": paf_len_b,
+        "paf_id_b": paf_id_b,
         "target_coverage": target_coverage,
         "bin_size": bin_size,
         "spanning_fraction": spanning_fraction,
         "run_assembler": run_assembler,
         "assembler": assembler if run_assembler else "N/A",
         "genome_size": genome_size if run_assembler else "N/A",
+        "disentangle_expected_size": disentangle_expected_size,
+        "disentangle_size_tolerance": disentangle_size_tolerance,
         "started_at": start_time.isoformat(),
-        "filter_mode": filter_mode,
-        "paf_len_a": paf_len_a,
-        "paf_id_a": paf_id_a,
-        "paf_len_b": paf_len_b,
-        "paf_id_b": paf_id_b,
-        "run_check_joins": run_check_joins,
-        "joins_window": joins_window,
-        "joins_min_id": joins_min_id,
-        "joins_min_ovlp": joins_min_ovlp,
-        "joins_expected_size": joins_expected_size,
-        "joins_size_tolerance": joins_size_tolerance,
     }
     with open(params_path, "w") as fh:
         json.dump(params, fh, indent=2)
     log.info("Parameters saved to %s", params_path)
 
     # -----------------------------------------------------------------------
-    # Step 1: Read Filtering
+    # Step 1: Per-chromosome PAF filter
     # -----------------------------------------------------------------------
     log.info("=" * 60)
-    log.info("STEP 1 — Read Filtering (mode: %s)", filter_mode)
+    log.info("STEP 1 — Per-chromosome PAF filter")
     log.info("=" * 60)
 
-    if filter_mode == "paf":
-        # PAF dual-threshold filter — replicates old_methods/align2.sh
-        # Bypasses BAM-based NUMT scrubber; uses raw PAF identity thresholds.
-        numt_stats = _run_paf_filter(
-            reads=reads,
+    chrom_filtered = _run_paf_filter_per_chrom(
+        reads=reads,
+        reference=reference,
+        chrom_names=chrom_names,
+        out_dir=dir_per_chrom,
+        threads=threads,
+        len_a=paf_len_a,
+        id_a=paf_id_a,
+        len_b=paf_len_b,
+        id_b=paf_id_b,
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 2: Per-chromosome downsampler
+    # -----------------------------------------------------------------------
+    log.info("=" * 60)
+    log.info("STEP 2 — Per-chromosome downsampler")
+    log.info("=" * 60)
+
+    chrom_downsampled: Dict[str, str] = {}
+    all_ds_stats: Dict[str, Dict] = {}
+
+    for chrom in chrom_names:
+        filtered_fq = chrom_filtered[chrom]
+        chrom_dir = dir_per_chrom / chrom
+        ds_fastq = str(chrom_dir / "downsampled.fastq")
+        ds_stats_path = str(chrom_dir / "downsample_stats.json")
+
+        stats = _downsample_chrom(
+            filtered_reads=filtered_fq,
             reference=reference,
-            output_fastq=scrubbed_reads,
+            chrom_name=chrom,
+            out_fastq=ds_fastq,
+            stats_path=ds_stats_path,
             threads=threads,
-            len_a=paf_len_a,
-            id_a=paf_id_a,
-            len_b=paf_len_b,
-            id_b=paf_id_b,
+            target_coverage=target_coverage,
+            bin_size=bin_size,
+            spanning_fraction=spanning_fraction,
         )
-        written = numt_stats["output_reads"]
-    else:
-        # Default: BAM-based NUMT scrubber with per-contig coverage baseline
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bam_path = os.path.join(tmpdir, "numt_aligned.bam")
-
-            numt_scrubber.run_minimap2(
-                reference=reference,
-                reads=reads,
-                bam_out=bam_path,
-                threads=threads,
-            )
-
-            cov_data = numt_scrubber.compute_sliding_window_coverage(
-                bam_path, window=coverage_window
-            )
-            per_contig_baselines = numt_scrubber.estimate_baselines(cov_data)
-            for contig, bl in per_contig_baselines.items():
-                log.info("  Contig %-30s  baseline=%.1fx", contig, bl)
-
-            clean_names, numt_stats = numt_scrubber.classify_reads(
-                bam_path=bam_path,
-                per_contig_baselines=per_contig_baselines,
-                coverage_threshold_ratio=coverage_threshold_ratio,
-                min_mapq=min_mapq,
-                min_mapped_fraction=min_mapped_fraction,
-                max_softclip_fraction=max_softclip_fraction,
-            )
-
-            written = numt_scrubber.extract_clean_reads(reads, clean_names, scrubbed_reads)
-            log.info("NUMT scrubber: %d → %d reads", numt_stats["total_alignments"], written)
-            numt_stats["output_reads"] = written
-
-    with open(numt_stats_path, "w") as fh:
-        json.dump(numt_stats, fh, indent=2)
+        chrom_downsampled[chrom] = ds_fastq
+        all_ds_stats[chrom] = stats
 
     # -----------------------------------------------------------------------
-    # Step 2: Downsampler
+    # Step 3 (optional): Per-chromosome assembly + mandatory disentangle
     # -----------------------------------------------------------------------
-    log.info("=" * 60)
-    log.info("STEP 2 — Uniform Downsampler")
-    log.info("=" * 60)
+    chrom_assembly_paths: Dict[str, Optional[str]] = {}
+    chrom_disentangle_results: Dict[str, Optional[Dict]] = {}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bam_path = os.path.join(tmpdir, "ds_aligned.bam")
-
-        downsampler.run_minimap2(
-            reference=reference,
-            reads=scrubbed_reads,
-            bam_out=bam_path,
-            threads=threads,
-        )
-
-        ds_reads = downsampler.load_read_info(bam_path, min_mapq=10)
-        bam = pysam.AlignmentFile(bam_path, "rb")
-        ref_lengths = dict(zip(bam.references, bam.lengths))
-        bam.close()
-
-        spanning = downsampler.find_spanning_reads(ds_reads, ref_lengths, spanning_fraction)
-        selected = downsampler.greedy_bin_selection(
-            ds_reads, ref_lengths, target_coverage=target_coverage, bin_size=bin_size
-        )
-        keep = selected | spanning
-
-        ds_written = downsampler.extract_reads(scrubbed_reads, keep, downsampled_reads)
-        log.info("Downsampler: %d → %d reads", len(ds_reads), ds_written)
-
-        achieved = downsampler.compute_achieved_coverage(keep, ds_reads, ref_lengths)
-
-    ds_stats: Dict = {
-        "input_alignments": len(ds_reads),
-        "spanning_reads": len(spanning),
-        "selected_reads": len(keep),
-        "output_reads": ds_written,
-        "target_coverage": target_coverage,
-        "achieved_coverage": achieved,
-        "ref_lengths": ref_lengths,  # needed by report for length-weighted coverage mean
-    }
-    with open(ds_stats_path, "w") as fh:
-        json.dump(ds_stats, fh, indent=2)
-
-    # -----------------------------------------------------------------------
-    # Step 3 (optional): Assembly
-    # -----------------------------------------------------------------------
-    assembly_path: Optional[str] = None
-    join_results: Optional[Dict] = None
     if run_assembler:
-        log.info("=" * 60)
-        log.info("STEP 3 — Assembly with %s", assembler)
-        log.info("=" * 60)
-        dir_asm.mkdir(parents=True, exist_ok=True)
         fn = ASSEMBLERS.get(assembler)
         if fn is None:
             log.warning("Unknown assembler '%s'. Skipping.", assembler)
         else:
-            try:
-                assembly_path = fn(
-                    reads=downsampled_reads,
-                    outdir=str(dir_asm),
-                    threads=threads,
-                    genome_size=genome_size,
-                )
-                log.info("Assembly written to %s", assembly_path)
-            except Exception as exc:
-                log.error("Assembly failed: %s", exc)
+            for chrom in chrom_names:
+                log.info("=" * 60)
+                log.info("STEP 3 — Assembly of %s with %s", chrom, assembler)
+                log.info("=" * 60)
 
-        if run_check_joins:
-            gfa_path = os.path.join(str(dir_asm), "assembly_graph.gfa")
-            if not os.path.exists(gfa_path):
-                log.warning("check_joins skipped: GFA not found at %s", gfa_path)
-            else:
-                log.info("=" * 60)
-                log.info("STEP 3b — Graph Join Analysis (check_joins)")
-                log.info("=" * 60)
-                joins_tsv = os.path.join(str(dir_asm), "candidate_joins.tsv")
-                joins_summary = os.path.join(str(dir_asm), "check_joins_summary.txt")
+                chrom_asm_dir = dir_asm / chrom
+                chrom_asm_dir.mkdir(parents=True, exist_ok=True)
+
+                ds_reads = chrom_downsampled[chrom]
+                assembly_path: Optional[str] = None
+
                 try:
-                    join_results = _run_check_joins(
-                        gfa_path=gfa_path,
-                        out_tsv=joins_tsv,
-                        summary_txt=joins_summary,
-                        window=joins_window,
-                        min_id=joins_min_id,
-                        min_ovlp=joins_min_ovlp,
-                        expected_size=joins_expected_size,
-                        size_tolerance=joins_size_tolerance,
+                    assembly_path = fn(
+                        reads=ds_reads,
+                        outdir=str(chrom_asm_dir),
+                        threads=threads,
+                        genome_size=genome_size,
                     )
-                    log.info("check_joins results: %s", join_results["candidate_joins_tsv"])
+                    log.info("Assembly for %s written to %s", chrom, assembly_path)
                 except Exception as exc:
-                    log.error("check_joins failed: %s", exc)
+                    log.error("Assembly of %s failed: %s", chrom, exc)
+
+                chrom_assembly_paths[chrom] = assembly_path
+
+                # Disentangle is MANDATORY after every successful assembly
+                gfa_path = str(chrom_asm_dir / "assembly_graph.gfa")
+                if not os.path.exists(gfa_path):
+                    log.warning(
+                        "disentangle skipped for %s: GFA not found at %s",
+                        chrom, gfa_path,
+                    )
+                    chrom_disentangle_results[chrom] = None
+                    continue
+
+                log.info("=" * 60)
+                log.info("STEP 3b — Disentangle graph for %s (mandatory)", chrom)
+                log.info("=" * 60)
+                dis_prefix = str(chrom_asm_dir / "disentangle")
+                try:
+                    dis_result = _run_disentangle(
+                        gfa_path=gfa_path,
+                        out_prefix=dis_prefix,
+                        window=disentangle_window,
+                        min_id=disentangle_min_id,
+                        min_ovlp=disentangle_min_ovlp,
+                        top_out=disentangle_top_out,
+                        expected_size=disentangle_expected_size,
+                        size_tolerance=disentangle_size_tolerance,
+                        max_depth=disentangle_max_depth,
+                        max_cycles=disentangle_max_cycles,
+                        max_linear=disentangle_max_linear,
+                        max_cycles_any=disentangle_max_cycles_any,
+                        fasta_top=disentangle_fasta_top,
+                    )
+                    log.info("disentangle_graph for %s: %s", chrom, dis_result["report_txt"])
+                    chrom_disentangle_results[chrom] = dis_result
+                except Exception as exc:
+                    log.error("disentangle_graph for %s failed: %s", chrom, exc)
+                    chrom_disentangle_results[chrom] = None
     else:
         log.info("Assembly step skipped (use --run-assembler to enable)")
-
-    if join_results is not None:
-        params["check_joins_results"] = join_results
 
     # -----------------------------------------------------------------------
     # Step 4: HTML Report
@@ -499,24 +584,48 @@ def run_pipeline(
     params["finished_at"] = datetime.now().isoformat()
     elapsed = (datetime.now() - start_time).total_seconds()
     params["elapsed_seconds"] = round(elapsed, 1)
+    if chrom_disentangle_results:
+        params["disentangle_results"] = {
+            k: v for k, v in chrom_disentangle_results.items() if v is not None
+        }
     with open(params_path, "w") as fh:
         json.dump(params, fh, indent=2)
 
+    # Use the first non-empty downsampled file as "final_reads" for report
+    final_reads_for_report = next(
+        (p for p in chrom_downsampled.values() if os.path.exists(p) and os.path.getsize(p) > 0),
+        reads,
+    )
+    # Aggregate ds_stats across chromosomes for report
+    total_output_reads = sum(s["output_reads"] for s in all_ds_stats.values())
+    agg_ds_stats: Dict = {
+        "input_alignments": sum(s["input_alignments"] for s in all_ds_stats.values()),
+        "spanning_reads": sum(s["spanning_reads"] for s in all_ds_stats.values()),
+        "selected_reads": sum(s["selected_reads"] for s in all_ds_stats.values()),
+        "output_reads": total_output_reads,
+        "target_coverage": target_coverage,
+        "achieved_coverage": {
+            chrom: all_ds_stats[chrom]["achieved_coverage"]
+            for chrom in chrom_names
+        },
+        "per_chrom": all_ds_stats,
+    }
+
     report_mod.generate_report(
         raw_reads=reads,
-        scrubbed_reads=scrubbed_reads,
-        final_reads=downsampled_reads,
+        scrubbed_reads=reads,       # no scrub step; raw == scrubbed
+        final_reads=final_reads_for_report,
         output_html=report_path,
-        numt_stats=numt_stats,
-        downsample_stats=ds_stats,
-        assembly_path=assembly_path,
+        numt_stats={"filter_mode": "paf_per_chrom", "scrub_removed": False},
+        downsample_stats=agg_ds_stats,
+        assembly_path=next(
+            (p for p in chrom_assembly_paths.values() if p is not None), None
+        ),
         parameters={
             "Threads": threads,
-            "Min MAPQ": min_mapq,
-            "Min mapped fraction": min_mapped_fraction,
-            "Max softclip fraction": max_softclip_fraction,
-            "Coverage window (bp)": coverage_window,
-            "Coverage threshold ratio": coverage_threshold_ratio,
+            "Chromosomes": ", ".join(chrom_names),
+            "PAF len_A / id_A": f"{paf_len_a} / {paf_id_a}",
+            "PAF len_B / id_B": f"{paf_len_b} / {paf_id_b}",
             "Target coverage": f"{target_coverage}x",
             "Bin size (bp)": bin_size,
             "Spanning fraction": spanning_fraction,
@@ -540,7 +649,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "MitoAssembler: End-to-end plant mitogenome assembly pipeline.\n"
-            "Runs NUMT scrubbing → uniform downsampling → (optional) assembly → HTML report."
+            "Per-chromosome PAF filter → per-chromosome downsampling → "
+            "(optional) per-chromosome assembly → disentangle graph → HTML report."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -553,71 +663,45 @@ def parse_args() -> argparse.Namespace:
     # General
     p.add_argument("--threads", type=int, default=4)
 
-    # Filter mode
-    grp_filter = p.add_argument_group("Read Filtering Mode")
-    grp_filter.add_argument(
-        "--filter-mode",
-        choices=["numt", "paf"],
-        default="numt",
-        dest="filter_mode",
-        help=(
-            "Filtering strategy: 'numt' uses BAM+coverage NUMT scrubber; "
-            "'paf' uses old_methods dual-threshold PAF filtering"
-        ),
-    )
-    grp_filter.add_argument("--paf-len-a", type=int, default=5000, dest="paf_len_a")
-    grp_filter.add_argument("--paf-id-a", type=float, default=0.90, dest="paf_id_a")
-    grp_filter.add_argument("--paf-len-b", type=int, default=3000, dest="paf_len_b")
-    grp_filter.add_argument("--paf-id-b", type=float, default=0.98, dest="paf_id_b")
-
-    # NUMT scrubber
-    grp_numt = p.add_argument_group("NUMT Scrubber")
-    grp_numt.add_argument("--min-mapq", type=int, default=20, dest="min_mapq")
-    grp_numt.add_argument("--min-mapped-fraction", type=float, default=0.80,
-                          dest="min_mapped_fraction")
-    grp_numt.add_argument("--max-softclip-fraction", type=float, default=0.20,
-                          dest="max_softclip_fraction")
-    grp_numt.add_argument("--coverage-window", type=int, default=500,
-                          dest="coverage_window")
-    grp_numt.add_argument("--coverage-threshold-ratio", type=float, default=0.20,
-                          dest="coverage_threshold_ratio")
+    # PAF filter
+    grp_paf = p.add_argument_group("Per-chromosome PAF filter")
+    grp_paf.add_argument("--paf-len-a", type=int, default=5000, dest="paf_len_a")
+    grp_paf.add_argument("--paf-id-a", type=float, default=0.90, dest="paf_id_a")
+    grp_paf.add_argument("--paf-len-b", type=int, default=3000, dest="paf_len_b")
+    grp_paf.add_argument("--paf-id-b", type=float, default=0.98, dest="paf_id_b")
 
     # Downsampler
-    grp_ds = p.add_argument_group("Downsampler")
+    grp_ds = p.add_argument_group("Per-chromosome Downsampler")
     grp_ds.add_argument("--target-coverage", type=int, default=100, dest="target_coverage")
     grp_ds.add_argument("--bin-size", type=int, default=500, dest="bin_size")
     grp_ds.add_argument("--spanning-fraction", type=float, default=0.80,
                         dest="spanning_fraction")
 
     # Assembler
-    grp_asm = p.add_argument_group("Assembler (optional)")
+    grp_asm = p.add_argument_group("Assembler (optional — per chromosome)")
     grp_asm.add_argument("--run-assembler", action="store_true", dest="run_assembler",
-                         help="Run assembly after downsampling")
+                         help="Run per-chromosome assembly after downsampling")
     grp_asm.add_argument("--assembler", default="flye",
                          choices=list(ASSEMBLERS.keys()))
     grp_asm.add_argument("--genome-size", default="500k", dest="genome_size",
                          help="Estimated genome size for assembler (e.g. 500k)")
-    grp_asm.add_argument(
-        "--run-check-joins",
-        action="store_true",
-        dest="run_check_joins",
-        help="Run check_joins.py on Flye assembly_graph.gfa when assembly is enabled",
-    )
-    grp_asm.add_argument("--joins-window", type=int, default=500, dest="joins_window")
-    grp_asm.add_argument("--joins-min-id", type=float, default=75.0, dest="joins_min_id")
-    grp_asm.add_argument("--joins-min-ovlp", type=int, default=100, dest="joins_min_ovlp")
-    grp_asm.add_argument(
-        "--joins-expected-size",
-        type=int,
-        default=494000,
-        dest="joins_expected_size",
-    )
-    grp_asm.add_argument(
-        "--joins-size-tolerance",
-        type=float,
-        default=0.20,
-        dest="joins_size_tolerance",
-    )
+
+    # Disentangle (mandatory when assembly runs)
+    grp_dis = p.add_argument_group("Disentangle graph (runs automatically with --run-assembler)")
+    grp_dis.add_argument("--disentangle-window", type=int, default=500, dest="disentangle_window")
+    grp_dis.add_argument("--disentangle-min-id", type=float, default=75.0, dest="disentangle_min_id")
+    grp_dis.add_argument("--disentangle-min-ovlp", type=int, default=100, dest="disentangle_min_ovlp")
+    grp_dis.add_argument("--disentangle-top-out", type=int, default=5, dest="disentangle_top_out")
+    grp_dis.add_argument("--disentangle-expected-size", type=int, default=494000,
+                         dest="disentangle_expected_size")
+    grp_dis.add_argument("--disentangle-size-tolerance", type=float, default=0.20,
+                         dest="disentangle_size_tolerance")
+    grp_dis.add_argument("--disentangle-max-depth", type=int, default=8, dest="disentangle_max_depth")
+    grp_dis.add_argument("--disentangle-max-cycles", type=int, default=30, dest="disentangle_max_cycles")
+    grp_dis.add_argument("--disentangle-max-linear", type=int, default=50, dest="disentangle_max_linear")
+    grp_dis.add_argument("--disentangle-max-cycles-any", type=int, default=200,
+                         dest="disentangle_max_cycles_any")
+    grp_dis.add_argument("--disentangle-fasta-top", type=int, default=20, dest="disentangle_fasta_top")
 
     # Report
     p.add_argument("--report-name", default="report.html", dest="report_name")
@@ -632,12 +716,6 @@ def main() -> None:
         reference=args.reference,
         outdir=args.outdir,
         threads=args.threads,
-        filter_mode=args.filter_mode,
-        min_mapq=args.min_mapq,
-        min_mapped_fraction=args.min_mapped_fraction,
-        max_softclip_fraction=args.max_softclip_fraction,
-        coverage_window=args.coverage_window,
-        coverage_threshold_ratio=args.coverage_threshold_ratio,
         paf_len_a=args.paf_len_a,
         paf_id_a=args.paf_id_a,
         paf_len_b=args.paf_len_b,
@@ -648,12 +726,17 @@ def main() -> None:
         run_assembler=args.run_assembler,
         assembler=args.assembler,
         genome_size=args.genome_size,
-        run_check_joins=args.run_check_joins,
-        joins_window=args.joins_window,
-        joins_min_id=args.joins_min_id,
-        joins_min_ovlp=args.joins_min_ovlp,
-        joins_expected_size=args.joins_expected_size,
-        joins_size_tolerance=args.joins_size_tolerance,
+        disentangle_window=args.disentangle_window,
+        disentangle_min_id=args.disentangle_min_id,
+        disentangle_min_ovlp=args.disentangle_min_ovlp,
+        disentangle_top_out=args.disentangle_top_out,
+        disentangle_expected_size=args.disentangle_expected_size,
+        disentangle_size_tolerance=args.disentangle_size_tolerance,
+        disentangle_max_depth=args.disentangle_max_depth,
+        disentangle_max_cycles=args.disentangle_max_cycles,
+        disentangle_max_linear=args.disentangle_max_linear,
+        disentangle_max_cycles_any=args.disentangle_max_cycles_any,
+        disentangle_fasta_top=args.disentangle_fasta_top,
         report_name=args.report_name,
     )
 
