@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-pipeline.py — MitoAssembler End-to-End Pipeline
+pipeline.py — MitoAssembler End-to-End Pipeline (Scheme 4)
 ================================================
 Single-command wrapper that orchestrates:
-  1. Per-chromosome PAF filter  (minimap2 PAF → per-chromosome read sets)
-  2. Per-chromosome Downsampler (downsampler.py, one run per chromosome)
+  1. Multi-chromosome PAF filter  (reads assigned to ALL valid chromosomes,
+     not just the single best — retains inter-chromosomal repeat-spanning reads)
+  2. Per-chromosome Downsampler   (spanning reads prioritised first, then greedy bin fill;
+     skippable with --skip-downsample to pass full-depth filtered reads to assembler)
   3. Per-chromosome Flye assembly
-  4. Disentangle graph          (disentangle_graph.py — mandatory)
-  5. HTML Report                (report.py)
+  4. Disentangle graph            (disentangle_graph.py — mandatory)
+  5. HTML Report                  (report.py)
 
 Usage
 -----
@@ -84,10 +86,10 @@ def _get_chrom_names(reference: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Per-chromosome PAF filter
+# Per-chromosome PAF filter  (Scheme 4 — multi-chrom assignment)
 # ---------------------------------------------------------------------------
 
-def _run_paf_filter_per_chrom(
+def _run_paf_filter_multi_chrom(
     reads: str,
     reference: str,
     chrom_names: List[str],
@@ -97,17 +99,25 @@ def _run_paf_filter_per_chrom(
     id_a: float = 0.90,
     len_b: int = 3000,
     id_b: float = 0.98,
+    secondary: bool = True,
 ) -> Dict[str, str]:
     """
-    Align all reads against the reference with minimap2 (PAF output).
-    For each chromosome, collect reads that pass the dual-threshold filter
-    AND whose primary alignment target is that chromosome.
+    Scheme 4 multi-chromosome PAF filter.
+
+    Unlike Scheme 1 (single best-chrom assignment), each read is placed into
+    EVERY chromosome pool for which it has a valid alignment that passes the
+    dual-threshold filter.  This is critical for plant mitogenomes where the
+    same repeat unit appears on multiple chromosomes — a read spanning the
+    repeat-to-unique boundary is valuable for BOTH assemblies.
+
+    secondary=True (default): include secondary alignments so multi-mapping
+    reads reach all relevant chromosomes.
 
     Returns a dict: {chrom_name: path_to_filtered_fastq}
     """
     log.info(
-        "PAF filter thresholds: A(len>=%d id>=%.2f)  B(len>=%d id>=%.2f)",
-        len_a, id_a, len_b, id_b,
+        "PAF multi-chrom filter: A(len>=%d id>=%.2f)  B(len>=%d id>=%.2f)  secondary=%s",
+        len_a, id_a, len_b, id_b, secondary,
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -115,18 +125,24 @@ def _run_paf_filter_per_chrom(
         mm2_cmd = [
             "minimap2", "-cx", "map-ont",
             "-t", str(threads),
-            reference, reads,
         ]
+        if secondary:
+            # --secondary=yes lets minimap2 emit secondary hits
+            # -N 10 caps secondary alignments per read to keep PAF manageable
+            mm2_cmd += ["--secondary=yes", "-N", "10"]
+        else:
+            mm2_cmd += ["--secondary=no"]
+        mm2_cmd += [reference, reads]
         log.info("minimap2 PAF: %s", " ".join(mm2_cmd))
         with open(paf_path, "w") as paf_fh:
             subprocess.run(mm2_cmd, stdout=paf_fh, check=True)
 
-        # chrom → set of read names that passed filter targeting that chrom
+        # chrom → set of read names that passed filter AND aligned to that chrom
+        # A read can appear in MULTIPLE chrom sets (multi-mapping intentional)
         chrom_reads: Dict[str, Set[str]] = {c: set() for c in chrom_names}
-        # Track best (score) alignment per read to assign it to one chrom
-        read_best_score: Dict[str, Tuple[float, str]] = {}  # name → (score, chrom)
 
         total_aln = 0
+        total_passed = 0
         with open(paf_path) as paf_fh:
             for line in paf_fh:
                 cols = line.split("\t")
@@ -139,39 +155,41 @@ def _run_paf_filter_per_chrom(
                 matches = int(cols[9])
                 if aln_len == 0:
                     continue
+                if target_name not in chrom_reads:
+                    continue
                 identity = matches / aln_len
 
                 passes = (aln_len >= len_a and identity >= id_a) or \
                          (aln_len >= len_b and identity >= id_b)
                 if not passes:
                     continue
-                if target_name not in chrom_reads:
-                    continue
 
-                score = identity * aln_len
-                prev = read_best_score.get(read_name)
-                if prev is None or score > prev[0]:
-                    # Remove from old chrom if re-assigned
-                    if prev is not None:
-                        chrom_reads[prev[1]].discard(read_name)
-                    read_best_score[read_name] = (score, target_name)
-                    chrom_reads[target_name].add(read_name)
+                # Place read into this chromosome's pool
+                # A read may appear in multiple pools — intentional for
+                # inter-chromosomal repeat-spanning reads
+                chrom_reads[target_name].add(read_name)
+                total_passed += 1
 
         log.info(
-            "PAF filter: %d alignments, reads per chrom: %s",
+            "PAF multi-chrom: %d alignments → %d passed | reads per chrom: %s",
             total_aln,
+            total_passed,
             {c: len(v) for c, v in chrom_reads.items()},
         )
 
-    # Write per-chromosome FASTQ files
-    result: Dict[str, str] = {}
-    # Accumulate all reads once into memory to avoid re-scanning for each chrom
+    # Build a set of ALL read names needed (union across all chroms)
+    all_needed: Set[str] = set()
+    for names in chrom_reads.values():
+        all_needed |= names
+
+    # Load all needed reads into memory once
     read_seqs: Dict[str, Tuple[str, str]] = {}  # name → (seq, qual)
     with pysam.FastxFile(reads) as fin:
         for entry in fin:
-            if entry.name is not None:
+            if entry.name is not None and entry.name in all_needed:
                 read_seqs[entry.name] = (entry.sequence or "", entry.quality or "")
 
+    result: Dict[str, str] = {}
     for chrom in chrom_names:
         chrom_dir = out_dir / chrom
         chrom_dir.mkdir(parents=True, exist_ok=True)
@@ -385,10 +403,12 @@ def run_pipeline(
     paf_id_a: float = 0.90,
     paf_len_b: int = 3000,
     paf_id_b: float = 0.98,
+    paf_secondary: bool = True,   # include secondary alignments (multi-mapping)
     # Downsampler options
-    target_coverage: int = 100,
+    target_coverage: int = 200,
     bin_size: int = 500,
     spanning_fraction: float = 0.80,
+    skip_downsample: bool = False,  # pass filtered reads directly to assembler, no depth cap
     # Assembler options
     run_assembler: bool = False,
     assembler: str = "flye",
@@ -434,12 +454,15 @@ def run_pipeline(
         "outdir": os.path.abspath(outdir),
         "threads": threads,
         "chromosomes": chrom_names,
+        "scheme": "4_multi_chrom",
         "paf_len_a": paf_len_a,
         "paf_id_a": paf_id_a,
         "paf_len_b": paf_len_b,
         "paf_id_b": paf_id_b,
+        "paf_secondary": paf_secondary,
         "target_coverage": target_coverage,
         "bin_size": bin_size,
+        "skip_downsample": skip_downsample,
         "spanning_fraction": spanning_fraction,
         "run_assembler": run_assembler,
         "assembler": assembler if run_assembler else "N/A",
@@ -456,10 +479,10 @@ def run_pipeline(
     # Step 1: Per-chromosome PAF filter
     # -----------------------------------------------------------------------
     log.info("=" * 60)
-    log.info("STEP 1 — Per-chromosome PAF filter")
+    log.info("STEP 1 — Multi-chromosome PAF filter (Scheme 4)")
     log.info("=" * 60)
 
-    chrom_filtered = _run_paf_filter_per_chrom(
+    chrom_filtered = _run_paf_filter_multi_chrom(
         reads=reads,
         reference=reference,
         chrom_names=chrom_names,
@@ -469,19 +492,57 @@ def run_pipeline(
         id_a=paf_id_a,
         len_b=paf_len_b,
         id_b=paf_id_b,
+        secondary=paf_secondary,
     )
 
     # -----------------------------------------------------------------------
     # Step 2: Per-chromosome downsampler
     # -----------------------------------------------------------------------
     log.info("=" * 60)
-    log.info("STEP 2 — Per-chromosome downsampler")
+    log.info("STEP 2 — Per-chromosome downsampler (skip=%s, target=%dx)", skip_downsample, target_coverage)
     log.info("=" * 60)
 
     chrom_downsampled: Dict[str, str] = {}
     all_ds_stats: Dict[str, Dict] = {}
 
     for chrom in chrom_names:
+        filtered_fq = chrom_filtered[chrom]
+        chrom_dir = dir_per_chrom / chrom
+        ds_fastq = str(chrom_dir / "downsampled.fastq")
+        ds_stats_path = str(chrom_dir / "downsample_stats.json")
+
+        if skip_downsample:
+            # Bypass downsampler — copy filtered reads directly (full-depth into assembler)
+            import shutil
+            shutil.copy2(filtered_fq, ds_fastq)
+            stats: Dict = {
+                "chrom": chrom,
+                "input_alignments": -1,
+                "spanning_reads": -1,
+                "selected_reads": -1,
+                "output_reads": -1,
+                "target_coverage": "skipped",
+                "achieved_coverage": {},
+                "ref_lengths": {},
+                "note": "downsampler skipped (--skip-downsample)",
+            }
+            with open(ds_stats_path, "w") as fh:
+                json.dump(stats, fh, indent=2)
+            log.info("  Chrom %-30s downsampler SKIPPED → using full-depth filtered reads", chrom)
+        else:
+            stats = _downsample_chrom(
+                filtered_reads=filtered_fq,
+                reference=reference,
+                chrom_name=chrom,
+                out_fastq=ds_fastq,
+                stats_path=ds_stats_path,
+                threads=threads,
+                target_coverage=target_coverage,
+                bin_size=bin_size,
+                spanning_fraction=spanning_fraction,
+            )
+        chrom_downsampled[chrom] = ds_fastq
+        all_ds_stats[chrom] = stats
         filtered_fq = chrom_filtered[chrom]
         chrom_dir = dir_per_chrom / chrom
         ds_fastq = str(chrom_dir / "downsampled.fastq")
@@ -648,9 +709,9 @@ def run_pipeline(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "MitoAssembler: End-to-end plant mitogenome assembly pipeline.\n"
-            "Per-chromosome PAF filter → per-chromosome downsampling → "
-            "(optional) per-chromosome assembly → disentangle graph → HTML report."
+            "MitoAssembler: End-to-end plant mitogenome assembly pipeline (Scheme 4).\n"
+            "Multi-chrom PAF filter (multi-mapping retained) → per-chromosome downsampling → "
+            "(optional) per-chromosome assembly → mandatory disentangle graph → HTML report."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -669,13 +730,32 @@ def parse_args() -> argparse.Namespace:
     grp_paf.add_argument("--paf-id-a", type=float, default=0.90, dest="paf_id_a")
     grp_paf.add_argument("--paf-len-b", type=int, default=3000, dest="paf_len_b")
     grp_paf.add_argument("--paf-id-b", type=float, default=0.98, dest="paf_id_b")
+    grp_paf.add_argument(
+        "--paf-no-secondary", action="store_false", dest="paf_secondary",
+        help=(
+            "Disable secondary alignments in PAF filter (default: enabled). "
+            "With secondary alignments a read can be placed in multiple chromosome "
+            "pools (Scheme 4). Disable to revert to single-best-chrom behaviour."
+        ),
+    )
+    grp_paf.set_defaults(paf_secondary=True)
 
     # Downsampler
     grp_ds = p.add_argument_group("Per-chromosome Downsampler")
-    grp_ds.add_argument("--target-coverage", type=int, default=100, dest="target_coverage")
+    grp_ds.add_argument("--target-coverage", type=int, default=200, dest="target_coverage",
+                        help="Target normalised coverage per chromosome (default: 200; ignored with --skip-downsample)")
     grp_ds.add_argument("--bin-size", type=int, default=500, dest="bin_size")
     grp_ds.add_argument("--spanning-fraction", type=float, default=0.80,
                         dest="spanning_fraction")
+    grp_ds.add_argument(
+        "--skip-downsample", action="store_true", dest="skip_downsample",
+        help=(
+            "Skip the downsampler entirely and pass full-depth filtered reads directly "
+            "to the assembler. Mirrors the behaviour of empirically successful direct-align "
+            "assemblies. Recommended when raw coverage is already moderate (100-300x) or "
+            "when the downsampler drops reads in low-coverage regions."
+        ),
+    )
 
     # Assembler
     grp_asm = p.add_argument_group("Assembler (optional — per chromosome)")
@@ -720,9 +800,11 @@ def main() -> None:
         paf_id_a=args.paf_id_a,
         paf_len_b=args.paf_len_b,
         paf_id_b=args.paf_id_b,
+        paf_secondary=args.paf_secondary,
         target_coverage=args.target_coverage,
         bin_size=args.bin_size,
         spanning_fraction=args.spanning_fraction,
+        skip_downsample=args.skip_downsample,
         run_assembler=args.run_assembler,
         assembler=args.assembler,
         genome_size=args.genome_size,
